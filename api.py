@@ -1,4 +1,4 @@
-import base64, json, gzip, httpx, os, asyncio
+import base64, json, gzip, requests, os
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,41 +26,42 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer":
 ANILIST_URL = "https://graphql.anilist.co"
 MIRURO_PIPE_URL = "https://www.miruro.online/api/secure/pipe"
 
-# Shared persistent clients — avoids creating a new TCP socket per request
-# which causes [Errno 16] EBUSY under concurrent load on Vercel serverless
-_LIMITS = httpx.Limits(max_connections=10, max_keepalive_connections=5)
-_http_client = httpx.AsyncClient(timeout=20.0, limits=_LIMITS, headers=HEADERS)
-_anilist_client = httpx.AsyncClient(timeout=15.0, limits=_LIMITS)
+# Single persistent requests Session — avoids EBUSY caused by httpx/anyio TCP
+# issues in Vercel's serverless Python sandbox
+_session = requests.Session()
+_session.headers.update(HEADERS)
 
 
-async def _http_get_with_retry(url: str, max_retries: int = 3) -> httpx.Response:
-    """GET with exponential backoff retry on connection errors (EBUSY / ConnectError)."""
+def _http_get(url: str, max_retries: int = 3) -> requests.Response:
+    """Sync GET with exponential backoff — runs in FastAPI's thread pool."""
+    import time
     delay = 0.5
     last_exc = None
     for attempt in range(max_retries):
         try:
-            res = await _http_client.get(url)
+            res = _session.get(url, timeout=20)
             return res
-        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        except requests.RequestException as exc:
             last_exc = exc
             if attempt < max_retries - 1:
-                await asyncio.sleep(delay)
+                time.sleep(delay)
                 delay *= 2
     raise HTTPException(status_code=503, detail=f"Upstream unreachable after {max_retries} retries: {last_exc}")
 
 
-async def _anilist_post_with_retry(body: dict, max_retries: int = 3) -> httpx.Response:
-    """POST to AniList with exponential backoff retry."""
+def _anilist_post(body: dict, max_retries: int = 3) -> requests.Response:
+    """Sync POST to AniList with retry."""
+    import time
     delay = 0.5
     last_exc = None
     for attempt in range(max_retries):
         try:
-            res = await _anilist_client.post(ANILIST_URL, json=body)
+            res = requests.post(ANILIST_URL, json=body, timeout=15)
             return res
-        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        except requests.RequestException as exc:
             last_exc = exc
             if attempt < max_retries - 1:
-                await asyncio.sleep(delay)
+                time.sleep(delay)
                 delay *= 2
     raise HTTPException(status_code=503, detail=f"AniList unreachable after {max_retries} retries: {last_exc}")
 
@@ -99,7 +100,7 @@ def _inject_source_slugs(data: dict, anilist_id: int):
                     ep["id"] = f"watch/{provider_name}/{anilist_id}/{category}/{prefix}-{ep['number']}"
     return data
 
-async def _fetch_raw_episodes(anilist_id: int) -> dict:
+def _fetch_raw_episodes(anilist_id: int) -> dict:
     """Internal helper to fetch raw, decoded episode data from Miruro pipe."""
     payload = {
         "path": "episodes",
@@ -109,7 +110,7 @@ async def _fetch_raw_episodes(anilist_id: int) -> dict:
         "version": "0.1.0",
     }
     encoded_req = _encode_pipe_request(payload)
-    res = await _http_get_with_retry(f"{MIRURO_PIPE_URL}?e={encoded_req}")
+    res = _http_get(f"{MIRURO_PIPE_URL}?e={encoded_req}")
     if res.status_code != 200:
         raise HTTPException(status_code=res.status_code, detail="Pipe request failed")
     data = _decode_pipe_response(res.text.strip())
@@ -267,12 +268,12 @@ def _encode_pipe_request(payload: dict) -> str:
     return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')
 
 
-async def _anilist_query(query: str, variables: dict = None):
+def _anilist_query(query: str, variables: dict = None):
     """Execute an AniList GraphQL query and return the data."""
     body = {"query": query}
     if variables:
         body["variables"] = variables
-    res = await _anilist_post_with_retry(body)
+    res = _anilist_post(body)
     if res.status_code != 200:
         raise HTTPException(status_code=500, detail="AniList query failed")
     return res.json().get("data", {})
@@ -281,7 +282,7 @@ async def _anilist_query(query: str, variables: dict = None):
 # ─── Homepage ────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-async def home():
+def home():
     return """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -524,7 +525,7 @@ async def home():
 # ─── Search & Suggestions ───────────────────────────────────────────────────
 
 @app.get("/search")
-async def search_anime(
+def search_anime(
     query: str,
     page: int = Query(1, ge=1, description="Page number"),
     per_page: int = Query(20, ge=1, le=50, description="Results per page"),
@@ -540,7 +541,7 @@ async def search_anime(
         }}
     }}
     """
-    data = await _anilist_query(gql, {"search": query, "page": page, "perPage": per_page})
+    data = _anilist_query(gql, {"search": query, "page": page, "perPage": per_page})
     page_data = data.get("Page", {})
     page_info = page_data.get("pageInfo", {})
     response = {
@@ -554,7 +555,7 @@ async def search_anime(
 
 
 @app.get("/suggestions")
-async def search_suggestions(
+def search_suggestions(
     query: str = Query(..., min_length=1, description="Search query for autocomplete"),
 ):
     """Lightweight search for dropdown autocomplete — returns minimal data fast."""
@@ -573,7 +574,7 @@ async def search_suggestions(
         }
     }
     """
-    data = await _anilist_query(gql, {"search": query})
+    data = _anilist_query(gql, {"search": query})
     results = []
     for item in data.get("Page", {}).get("media", []):
         results.append({
@@ -601,7 +602,7 @@ SORT_MAP = {
 }
 
 @app.get("/filter")
-async def filter_anime(
+def filter_anime(
     genre: Optional[str] = Query(None, description="Genre name, e.g. Action, Romance"),
     tag: Optional[str] = Query(None, description="Tag name, e.g. Isekai, Time Skip"),
     year: Optional[int] = Query(None, description="Season year, e.g. 2025"),
@@ -661,7 +662,7 @@ async def filter_anime(
         }}
     }}
     """
-    data = await _anilist_query(gql, variables)
+    data = _anilist_query(gql, variables)
     page_data = data.get("Page", {})
     page_info = page_data.get("pageInfo", {})
     response = {
@@ -676,7 +677,7 @@ async def filter_anime(
 
 # ─── Collection Endpoints (with pagination) ─────────────────────────────────
 
-async def _fetch_collection(sort_type: str, status: str = None, page: int = 1, per_page: int = 20):
+def _fetch_collection(sort_type: str, status: str = None, page: int = 1, per_page: int = 20):
     """Internal helper for fetching collections like trending, popular, etc."""
     status_filter = f", status: {status}" if status else ""
     gql = f"""
@@ -689,7 +690,7 @@ async def _fetch_collection(sort_type: str, status: str = None, page: int = 1, p
         }}
     }}
     """
-    data = await _anilist_query(gql, {"page": page, "perPage": per_page})
+    data = _anilist_query(gql, {"page": page, "perPage": per_page})
     page_data = data.get("Page", {})
     page_info = page_data.get("pageInfo", {})
     response = {
@@ -703,7 +704,7 @@ async def _fetch_collection(sort_type: str, status: str = None, page: int = 1, p
 
 
 @app.get("/spotlight")
-async def get_spotlight():
+def get_spotlight():
     """Get the spotlight anime – high-priority trending and popular titles."""
     gql = f"""
     query {{
@@ -714,49 +715,49 @@ async def get_spotlight():
         }}
     }}
     """
-    data = await _anilist_query(gql)
+    data = _anilist_query(gql)
     media = data.get("Page", {}).get("media", [])
     return _proxy_deep_images({"results": media})
 
 
 @app.get("/trending")
-async def get_trending(
+def get_trending(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=50),
 ):
     """Get trending anime with full metadata and pagination."""
-    return await _fetch_collection("TRENDING_DESC", page=page, per_page=per_page)
+    return _fetch_collection("TRENDING_DESC", page=page, per_page=per_page)
 
 
 @app.get("/popular")
-async def get_popular(
+def get_popular(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=50),
 ):
     """Get most popular anime of all time with full metadata and pagination."""
-    return await _fetch_collection("POPULARITY_DESC", page=page, per_page=per_page)
+    return _fetch_collection("POPULARITY_DESC", page=page, per_page=per_page)
 
 
 @app.get("/upcoming")
-async def get_upcoming(
+def get_upcoming(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=50),
 ):
     """Get upcoming anime with full metadata and pagination."""
-    return await _fetch_collection("POPULARITY_DESC", "NOT_YET_RELEASED", page=page, per_page=per_page)
+    return _fetch_collection("POPULARITY_DESC", "NOT_YET_RELEASED", page=page, per_page=per_page)
 
 
 @app.get("/recent")
-async def get_recent(
+def get_recent(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=50),
 ):
     """Get currently airing anime with full metadata and pagination."""
-    return await _fetch_collection("START_DATE_DESC", "RELEASING", page=page, per_page=per_page)
+    return _fetch_collection("START_DATE_DESC", "RELEASING", page=page, per_page=per_page)
 
 
 @app.get("/schedule")
-async def get_schedule(
+def get_schedule(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=50),
 ):
@@ -776,7 +777,7 @@ async def get_schedule(
         }}
     }}
     """
-    data = await _anilist_query(gql, {"page": page, "perPage": per_page})
+    data = _anilist_query(gql, {"page": page, "perPage": per_page})
     page_data = data.get("Page", {})
     page_info = page_data.get("pageInfo", {})
     results = []
@@ -799,7 +800,7 @@ async def get_schedule(
 # ─── Anime Details ───────────────────────────────────────────────────────────
 
 @app.get("/info/{anilist_id}")
-async def get_anime_info(anilist_id: int):
+def get_anime_info(anilist_id: int):
     """Get complete anime page data — everything AniList has to offer."""
     gql = f"""
     query ($id: Int) {{
@@ -808,7 +809,7 @@ async def get_anime_info(anilist_id: int):
         }}
     }}
     """
-    data = await _anilist_query(gql, {"id": anilist_id})
+    data = _anilist_query(gql, {"id": anilist_id})
     media = data.get("Media")
     if not media:
         raise HTTPException(status_code=404, detail="Anime not found")
@@ -816,7 +817,7 @@ async def get_anime_info(anilist_id: int):
 
 
 @app.get("/anime/{anilist_id}/characters")
-async def get_anime_characters(
+def get_anime_characters(
     anilist_id: int,
     page: int = Query(1, ge=1),
     per_page: int = Query(25, ge=1, le=50),
@@ -853,7 +854,7 @@ async def get_anime_characters(
         }
     }
     """
-    data = await _anilist_query(gql, {"id": anilist_id, "page": page, "perPage": per_page})
+    data = _anilist_query(gql, {"id": anilist_id, "page": page, "perPage": per_page})
     media = data.get("Media")
     if not media:
         raise HTTPException(status_code=404, detail="Anime not found")
@@ -870,7 +871,7 @@ async def get_anime_characters(
 
 
 @app.get("/anime/{anilist_id}/relations")
-async def get_anime_relations(anilist_id: int):
+def get_anime_relations(anilist_id: int):
     """Get all related anime/manga for an anime (sequels, prequels, side stories, etc.)."""
     gql = """
     query ($id: Int) {
@@ -900,7 +901,7 @@ async def get_anime_relations(anilist_id: int):
         }
     }
     """
-    data = await _anilist_query(gql, {"id": anilist_id})
+    data = _anilist_query(gql, {"id": anilist_id})
     media = data.get("Media")
     if not media:
         raise HTTPException(status_code=404, detail="Anime not found")
@@ -913,7 +914,7 @@ async def get_anime_relations(anilist_id: int):
 
 
 @app.get("/anime/{anilist_id}/recommendations")
-async def get_anime_recommendations(
+def get_anime_recommendations(
     anilist_id: int,
     page: int = Query(1, ge=1),
     per_page: int = Query(10, ge=1, le=25),
@@ -947,7 +948,7 @@ async def get_anime_recommendations(
         }
     }
     """
-    data = await _anilist_query(gql, {"id": anilist_id, "page": page, "perPage": per_page})
+    data = _anilist_query(gql, {"id": anilist_id, "page": page, "perPage": per_page})
     media = data.get("Media")
     if not media:
         raise HTTPException(status_code=404, detail="Anime not found")
@@ -966,14 +967,14 @@ async def get_anime_recommendations(
 # ─── Streaming (Pipe-based — unchanged logic) ───────────────────────────────
 
 @app.get("/episodes/{anilist_id}")
-async def get_episodes(anilist_id: int):
+def get_episodes(anilist_id: int):
     """Get the episode list for an anime, with slugified source IDs."""
-    data = await _fetch_raw_episodes(anilist_id)
+    data = _fetch_raw_episodes(anilist_id)
     return _proxy_deep_images(_inject_source_slugs(data, anilist_id))
 
 
 @app.get("/sources")
-async def get_sources(
+def get_sources(
     episodeId: str = Query(..., description="Plain-text episode ID from /episodes response"),
     provider: str = Query(..., description="Provider name, e.g. kiwi, arc, telli"),
     anilistId: int = Query(..., description="AniList anime ID"),
@@ -994,15 +995,15 @@ async def get_sources(
         "version": "0.1.0",
     }
     encoded_req = _encode_pipe_request(payload)
-    res = await _http_get_with_retry(f"{MIRURO_PIPE_URL}?e={encoded_req}")
+    res = _http_get(f"{MIRURO_PIPE_URL}?e={encoded_req}")
     if res.status_code != 200:
         raise HTTPException(status_code=res.status_code, detail="Pipe request failed")
     return _proxy_deep_images(_decode_pipe_response(res.text.strip()))
 
 @app.get("/watch/{provider}/{anilist_id}/{category}/{slug}")
-async def get_watch_sources(provider: str, anilist_id: int, category: str, slug: str):
+def get_watch_sources(provider: str, anilist_id: int, category: str, slug: str):
     """The super simple sources endpoint resolving slugs (prefix-number) back to provider IDs."""
-    data = await _fetch_raw_episodes(anilist_id)
+    data = _fetch_raw_episodes(anilist_id)
     prov_data = data.get("providers", {}).get(provider, {})
     ep_list = prov_data.get("episodes", {}).get(category, [])
     
@@ -1019,4 +1020,4 @@ async def get_watch_sources(provider: str, anilist_id: int, category: str, slug:
     if not target_id:
         raise HTTPException(status_code=404, detail=f"Episode slug '{slug}' not found for provider {provider}")
         
-    return await get_sources(episodeId=target_id, provider=provider, anilistId=anilist_id, category=category)
+    return get_sources(episodeId=target_id, provider=provider, anilistId=anilist_id, category=category)
