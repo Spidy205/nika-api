@@ -1,4 +1,4 @@
-import base64, json, gzip, httpx, os
+import base64, json, gzip, httpx, os, asyncio
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +25,44 @@ app.add_middleware(
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": "https://www.miruro.online/"}
 ANILIST_URL = "https://graphql.anilist.co"
 MIRURO_PIPE_URL = "https://www.miruro.online/api/secure/pipe"
+
+# Shared persistent clients — avoids creating a new TCP socket per request
+# which causes [Errno 16] EBUSY under concurrent load on Vercel serverless
+_LIMITS = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+_http_client = httpx.AsyncClient(timeout=20.0, limits=_LIMITS, headers=HEADERS)
+_anilist_client = httpx.AsyncClient(timeout=15.0, limits=_LIMITS)
+
+
+async def _http_get_with_retry(url: str, max_retries: int = 3) -> httpx.Response:
+    """GET with exponential backoff retry on connection errors (EBUSY / ConnectError)."""
+    delay = 0.5
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            res = await _http_client.get(url)
+            return res
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            last_exc = exc
+            if attempt < max_retries - 1:
+                await asyncio.sleep(delay)
+                delay *= 2
+    raise HTTPException(status_code=503, detail=f"Upstream unreachable after {max_retries} retries: {last_exc}")
+
+
+async def _anilist_post_with_retry(body: dict, max_retries: int = 3) -> httpx.Response:
+    """POST to AniList with exponential backoff retry."""
+    delay = 0.5
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            res = await _anilist_client.post(ANILIST_URL, json=body)
+            return res
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            last_exc = exc
+            if attempt < max_retries - 1:
+                await asyncio.sleep(delay)
+                delay *= 2
+    raise HTTPException(status_code=503, detail=f"AniList unreachable after {max_retries} retries: {last_exc}")
 
 def _proxy_img(url: str) -> str:
     # Proxy removed — return original image URL
@@ -71,13 +109,12 @@ async def _fetch_raw_episodes(anilist_id: int) -> dict:
         "version": "0.1.0",
     }
     encoded_req = _encode_pipe_request(payload)
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=HEADERS)
-        if res.status_code != 200:
-            raise HTTPException(status_code=res.status_code, detail="Pipe request failed")
-        data = _decode_pipe_response(res.text.strip())
-        _deep_translate(data)
-        return data
+    res = await _http_get_with_retry(f"{MIRURO_PIPE_URL}?e={encoded_req}")
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail="Pipe request failed")
+    data = _decode_pipe_response(res.text.strip())
+    _deep_translate(data)
+    return data
 
 # ─── Shared GraphQL Fragments ────────────────────────────────────────────────
 
@@ -235,11 +272,10 @@ async def _anilist_query(query: str, variables: dict = None):
     body = {"query": query}
     if variables:
         body["variables"] = variables
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.post(ANILIST_URL, json=body)
-        if res.status_code != 200:
-            raise HTTPException(status_code=500, detail="AniList query failed")
-        return res.json().get("data", {})
+    res = await _anilist_post_with_retry(body)
+    if res.status_code != 200:
+        raise HTTPException(status_code=500, detail="AniList query failed")
+    return res.json().get("data", {})
 
 
 # ─── Homepage ────────────────────────────────────────────────────────────────
@@ -958,11 +994,10 @@ async def get_sources(
         "version": "0.1.0",
     }
     encoded_req = _encode_pipe_request(payload)
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=HEADERS)
-        if res.status_code != 200:
-            raise HTTPException(status_code=res.status_code, detail="Pipe request failed")
-        return _proxy_deep_images(_decode_pipe_response(res.text.strip()))
+    res = await _http_get_with_retry(f"{MIRURO_PIPE_URL}?e={encoded_req}")
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail="Pipe request failed")
+    return _proxy_deep_images(_decode_pipe_response(res.text.strip()))
 
 @app.get("/watch/{provider}/{anilist_id}/{category}/{slug}")
 async def get_watch_sources(provider: str, anilist_id: int, category: str, slug: str):
