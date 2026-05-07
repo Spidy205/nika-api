@@ -1,5 +1,5 @@
 fastapi
-httpx
+requests
 uvicorn
 mangum
 python-dotenv
